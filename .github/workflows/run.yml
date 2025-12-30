@@ -1,0 +1,442 @@
+name: Run
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  auto-updates:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pycryptodome httpx pillow
+          sudo apt-get update
+          sudo apt-get install -y aria2 wget jq
+          
+      - name: Restore authlite.py from base64 secret
+        run: |
+          echo "${{ secrets.AUTHLITE_PY_BASE64 }}" | base64 --decode > authlite.py
+
+      - name: Download proxy list
+        run: |
+          proxy_list_url="https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/countries/CN/data.txt"
+          wget -O proxies.txt "$proxy_list_url" || echo "Failed to download proxy list, proceeding without proxies."
+
+      - name: Run authlite.py
+        id: run-authlite
+        run: |
+          clean_url() {
+            echo -n "$1" | tr -d '\r\n' | sed 's/[[:space:]]*$//' | tr -cd '[:print:]'
+          }
+          
+          if [ -f "proxies.txt" ]; then
+            grep -v '^#' proxies.txt | grep -v '^$' > clean_proxies.txt
+          else
+            echo "proxies.txt not found, running without proxy"
+            output=$(python authlite.py)
+            echo "Authlite output: $output"
+            
+            uri_part=$(echo "$output" | grep -oP '(?<=uri=).*$' || echo "")
+            links=$(echo "$uri_part" | tr '|' '\n')
+            
+            option_link=""
+            for link in $links; do
+              if [[ $link == *"SDGB_option"* ]]; then
+                option_link=$(clean_url "$link")
+                break
+              fi
+            done
+            
+            if [ -z "$option_link" ]; then
+              echo "No SDGB_option link found, exiting."
+              exit 0
+            fi
+            
+            echo "Found option link: $option_link"
+            echo "option_link=$option_link" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          executed=false
+          while IFS= read -r proxy; do
+            echo "Trying proxy: $proxy"
+            
+            export HTTP_PROXY="$proxy"
+            export HTTPS_PROXY="$proxy"
+            
+            if output=$(python authlite.py 2>/dev/null); then
+              if [[ -n "$output" ]]; then
+                executed=true
+                echo "Proxy $proxy succeeded!"
+                break
+              fi
+            fi
+            
+            echo "Proxy $proxy failed, trying next..."
+            unset HTTP_PROXY HTTPS_PROXY
+          done < clean_proxies.txt
+
+          if [ "$executed" != "true" ]; then
+            echo "All proxies failed or no available proxy, trying direct connection..."
+            unset HTTP_PROXY HTTPS_PROXY
+            output=$(python authlite.py)
+            if [ $? -ne 0 ]; then
+              echo "Direct connection also failed!"
+              exit 1
+            fi
+          fi
+
+          echo "Authlite output: $output"
+
+          uri_part=$(echo "$output" | grep -oP '(?<=uri=).*$' || echo "")
+          links=$(echo "$uri_part" | tr '|' '\n')
+
+          option_link=""
+          for link in $links; do
+            if [[ $link == *"SDGB_option"* ]]; then
+              option_link=$(clean_url "$link")
+              break
+            fi
+          done
+
+          if [ -z "$option_link" ]; then
+            echo "No SDGB_option link found, exiting."
+            exit 0
+          fi
+
+          echo "Found option link: $option_link"
+          echo "option_link=$option_link" >> $GITHUB_OUTPUT
+
+      - name: Cache previous option link
+        id: cache-link
+        uses: actions/cache@v4
+        with:
+          path: .previous_option_link
+          key: option-link-${{ github.run_id }}
+          restore-keys: |
+            option-link-
+
+      - name: Check if option link changed
+        id: check-cache
+        run: |
+          current_link="${{ steps.run-authlite.outputs.option_link }}"
+          
+          if [ -f ".previous_option_link" ]; then
+            previous_link=$(cat .previous_option_link)
+            if [ "$previous_link" == "$current_link" ]; then
+              echo "No new update, skipping all subsequent steps"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "New version detected! Continue processing..."
+            fi
+          else
+            echo "First run, continue processing..."
+          fi
+          
+          echo "$current_link" > .previous_option_link
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Download TXT
+        if: steps.check-cache.outputs.skip == 'false'
+        id: download-txt
+        run: |
+          clean_url() {
+            echo -n "$1" | tr -d '\r\n' | sed 's/[[:space:]]*$//' | tr -cd '[:print:]'
+          }
+          
+          option_link="${{ steps.run-authlite.outputs.option_link }}"
+          option_link=$(clean_url "$option_link")
+          echo "Downloading from: $option_link"
+          
+          if [ -f "clean_proxies.txt" ]; then
+            downloaded=false
+            while IFS= read -r proxy; do
+              echo "Trying proxy: $proxy"
+              if HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy" wget --user-agent="A63E01D8906" -O option.txt "$option_link" --timeout=10 --tries=1; then
+                downloaded=true
+                break
+              fi
+              echo "Proxy $proxy failed, trying next..."
+            done < clean_proxies.txt
+            
+            if [ "$downloaded" != "true" ]; then
+              echo "All proxies failed. Attempting direct download."
+              wget --user-agent="A63E01D8906" -O option.txt "$option_link" || exit 1
+            fi
+          else
+            wget --user-agent="A63E01D8906" -O option.txt "$option_link" || exit 1
+          fi
+          
+          if [ ! -s "option.txt" ]; then
+            echo "Failed to download option.txt or file is empty"
+            exit 1
+          fi
+          
+          axxx=$(basename "$option_link" | grep -oP 'SDGB_option_\d+\.\d+_(\d{8}_\d{6})_A\d+' | grep -oP '_A\d+' | sed 's/_A//')
+          echo "Extracting for A$axxx"
+          
+          install_line=$(grep "INSTALL1=.*SDGB_A${axxx}_" option.txt)
+          opt_url=$(echo "$install_line" | cut -d'=' -f2)
+          
+          if [ -z "$opt_url" ]; then
+            echo "No matching .opt URL found."
+            exit 0
+          fi
+          
+          opt_url=$(clean_url "$opt_url")
+          
+          echo "Found .opt URL: $opt_url"
+          echo "opt_url=$opt_url" >> $GITHUB_OUTPUT
+
+      - name: Download OPT
+        if: steps.check-cache.outputs.skip == 'false'
+        run: |
+          clean_url() {
+            echo -n "$1" | tr -d '\r\n' | sed 's/[[:space:]]*$//' | tr -cd '[:print:]'
+          }
+          
+          opt_url="${{ steps.download-txt.outputs.opt_url }}"
+          opt_url=$(clean_url "$opt_url")
+          echo "Downloading OPT from: $opt_url"
+          
+          opt_filename=$(basename "$opt_url")
+          
+          if [ -f "clean_proxies.txt" ]; then
+            downloaded=false
+            while IFS= read -r proxy; do
+              echo "Trying proxy: $proxy"
+              proxy_host=$(echo "$proxy" | sed 's#http://##; s#https://##' | cut -d: -f1)
+              proxy_port=$(echo "$proxy" | sed 's#http://##; s#https://##' | cut -d: -f2)
+              
+              if aria2c --all-proxy="$proxy" \
+                        --header="User-Agent: A63E01D8906" \
+                        --max-connection-per-server=8 \
+                        --split=64 \
+                        --min-split-size=1M \
+                        --timeout=10 \
+                        --max-tries=1 \
+                        --check-certificate=false \
+                        --out="$opt_filename" \
+                        "$opt_url"; then
+                downloaded=true
+                break
+              fi
+              echo "Proxy $proxy failed, trying next..."
+            done < clean_proxies.txt
+            
+            if [ "$downloaded" != "true" ]; then
+              echo "All proxies failed. Attempting direct download."
+              aria2c --header="User-Agent: A63E01D8906" \
+                     --max-connection-per-server=8 \
+                     --split=64 \
+                     --min-split-size=1M \
+                     --timeout=10 \
+                     --max-tries=1 \
+                     --check-certificate=false \
+                     --out="$opt_filename" \
+                     "$opt_url" || exit 1
+            fi
+          else
+            aria2c --header="User-Agent: A63E01D8906" \
+                   --max-connection-per-server=8 \
+                   --split=64 \
+                   --min-split-size=1M \
+                   --timeout=10 \
+                   --max-tries=1 \
+                   --check-certificate=false \
+                   --out="$opt_filename" \
+                   "$opt_url" || exit 1
+          fi
+          
+          if [ ! -s "$opt_filename" ]; then
+            echo "Failed to download $opt_filename or file is empty"
+            exit 1
+          fi
+          
+          echo "OPT file downloaded successfully with aria2: $opt_filename"
+
+      - name: Decrypt OPT
+        if: steps.check-cache.outputs.skip == 'false'
+        run: |
+          opt_url="${{ steps.download-txt.outputs.opt_url }}"
+          opt_filename=$(basename "$opt_url" | tr -d '\r\n')
+          
+          if [ ! -f "$opt_filename" ]; then
+            echo "OPT file not found: $opt_filename"
+            exit 1
+          fi
+          
+          chmod +x fsdecrypt
+          ./fsdecrypt "$opt_filename"
+          
+          decrypted_folder=$(basename "$opt_filename" .opt)
+          
+          if [ ! -d "$decrypted_folder" ]; then
+            echo "Decryption failed, folder not found: $decrypted_folder"
+            exit 1
+          fi
+          
+          echo "Decryption successful: $decrypted_folder"
+
+      - name: Process images and create ZIP
+        if: steps.check-cache.outputs.skip == 'false'
+        run: |
+          opt_url="${{ steps.download-txt.outputs.opt_url }}"
+          decrypted_folder=$(basename "$opt_url" .opt | tr -d '\r\n')
+          axxx=$(echo "$decrypted_folder" | grep -oP '_A\d+' | sed 's/_A//')
+          
+          if [ ! -d "$decrypted_folder" ]; then
+            echo "Decrypted folder not found: $decrypted_folder"
+            exit 1
+          fi
+          
+          info_dir="$decrypted_folder/information"
+          output_image=""
+          
+          if [ -d "$info_dir" ]; then
+            output_image="SDGB_A${axxx}_information.png"
+            
+            images=$(find "$info_dir" -type f -name "*.png" | sort)
+            
+            if [ -n "$images" ]; then
+              echo "Processing images: $images"
+              
+              IMAGES="$images" OUTPUT_IMAGE="$output_image" python process_images.py
+              
+            else
+              echo "No PNG images found in $info_dir, skipping image creation."
+              output_image=""
+            fi
+          else
+            echo "Information folder not found: $info_dir, skipping image processing."
+            output_image=""
+          fi
+          
+          mv "$decrypted_folder" "A${axxx}"
+          
+          if [ ! -d "A${axxx}" ]; then
+            echo "Failed to rename folder to A${axxx}"
+            exit 1
+          fi
+          
+          zip_filename="$decrypted_folder.zip"
+          zip -r "$zip_filename" "A${axxx}"
+          
+          if [ ! -f "$zip_filename" ]; then
+            echo "Failed to create ZIP file: $zip_filename"
+            exit 1
+          fi
+          
+          if [ -n "$output_image" ] && [ -f "$output_image" ]; then
+            echo "Processing completed: $output_image and $zip_filename created"
+          else
+            echo "Processing completed: $zip_filename created (no information image)"
+          fi
+
+      - name: Upload artifacts
+        if: steps.check-cache.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-files
+          path: |
+            SDGB_A*_information.png
+            SDGB_*_*.zip
+          if-no-files-found: warn
+
+      - name: Send to Telegram
+        if: steps.check-cache.outputs.skip == 'false'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          opt_url="${{ steps.download-txt.outputs.opt_url }}"
+          clean_opt_url=$(echo -n "$opt_url" | tr -d '\r\n')
+          axxx=$(echo "$clean_opt_url" | grep -oP '_A\d+' | sed 's/_A//')
+          
+          zip_file=$(ls SDGB_*_*.zip | head -1)
+          
+          if [ ! -f "$zip_file" ]; then
+            echo "ZIP file not found"
+            exit 1
+          fi
+          
+          echo "Checking file sizes..."
+          
+          zip_size=$(stat -c%s "$zip_file")
+          size_limit=$((50 * 1024 * 1024))
+          
+          run_link="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          
+          echo "ZIP file size: $zip_size bytes"
+          echo "Size limit: $size_limit bytes"
+          
+          image="SDGB_A${axxx}_information.png"
+          if [ -f "$image" ]; then
+            echo "Sending image as photo to Telegram..."
+            curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
+                 -F photo="@$image" \
+                 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendPhoto" > /dev/null
+            
+            if [ $? -eq 0 ]; then
+              echo "Image sent as photo successfully"
+              
+              echo "Sending image as document to Telegram..."
+              curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
+                   -F document="@$image" \
+                   -F caption="SDGB_A${axxx}_information.png" \
+                   "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" > /dev/null
+              
+              if [ $? -eq 0 ]; then
+                echo "Image sent as document successfully"
+              else
+                echo "Failed to send image as document"
+              fi
+            else
+              echo "Failed to send image as photo"
+            fi
+          else
+            echo "Image file not found, skipping image send."
+          fi
+          
+          if [ "$zip_size" -gt "$size_limit" ]; then
+            echo "ZIP file is too large ($zip_size bytes > $size_limit bytes)"
+            
+            message="🚨 A${axxx} 已经更新，但文件过大（$((zip_size/1024/1024))MB），请前往CI下载：$run_link"
+            
+            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+                 -d "chat_id=$TELEGRAM_CHAT_ID" \
+                 -d "text=$message" \
+                 -d "parse_mode=HTML" > /dev/null
+            
+            if [ $? -eq 0 ]; then
+              echo "Message sent: ZIP file too large, download link provided"
+            else
+              echo "Failed to send message"
+            fi
+          else
+            echo "ZIP file is within size limit ($zip_size bytes <= $size_limit bytes)"
+            
+            echo "Sending ZIP file to Telegram..."
+            curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
+                 -F document="@$zip_file" \
+                 -F caption="SDGB A${axxx} Update" \
+                 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" > /dev/null
+            
+            if [ $? -eq 0 ]; then
+              echo "ZIP file sent successfully"
+            else
+              echo "Failed to send ZIP file"
+            fi
+          fi
