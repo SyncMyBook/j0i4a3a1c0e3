@@ -28,10 +28,16 @@ jobs:
         run: |
           echo "${{ secrets.AUTHLITE_PY_BASE64 }}" | base64 --decode > authlite.py
 
-      - name: Download proxy list
+      - name: Download and filter http proxies only
         run: |
           proxy_list_url="https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/countries/CN/data.txt"
-          wget -O proxies.txt "$proxy_list_url" || echo "Failed to download proxy list, proceeding without proxies."
+          wget -O proxies.txt "$proxy_list_url" || echo "Failed to download proxy list."
+          
+          if [ -f "proxies.txt" ]; then
+            grep -E '^https?://' proxies.txt > proxies_http.txt && mv proxies_http.txt proxies.txt
+            count=$(wc -l < proxies.txt)
+            echo "Filtered to $count HTTP proxies"
+          fi
 
       - name: Run authlite.py
         id: run-authlite
