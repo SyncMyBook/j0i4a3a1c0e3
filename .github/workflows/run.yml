@@ -390,27 +390,16 @@ jobs:
           
           image="SDGB_A${axxx}_information.png"
           if [ -f "$image" ]; then
-            echo "Sending image as photo to Telegram..."
+            echo "Sending information image as document to Telegram..."
             curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
-                 -F photo="@$image" \
-                 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendPhoto" > /dev/null
+                 -F document="@$image" \
+                 -F caption="SDGB_A${axxx}_information.png" \
+                 "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" > /dev/null
             
             if [ $? -eq 0 ]; then
-              echo "Image sent as photo successfully"
-              
-              echo "Sending image as document to Telegram..."
-              curl -s -F chat_id="$TELEGRAM_CHAT_ID" \
-                   -F document="@$image" \
-                   -F caption="SDGB_A${axxx}_information.png" \
-                   "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" > /dev/null
-              
-              if [ $? -eq 0 ]; then
-                echo "Image sent as document successfully"
-              else
-                echo "Failed to send image as document"
-              fi
+              echo "Image sent as document successfully"
             else
-              echo "Failed to send image as photo"
+              echo "Failed to send image as document"
             fi
           else
             echo "Image file not found, skipping image send."
